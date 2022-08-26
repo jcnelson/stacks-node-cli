@@ -1,0 +1,1576 @@
+#!/usr/bin/env node
+
+const stx_common = require("@stacks/common");
+
+// disable debug logging
+let stacksConfig = stx_common.config;
+stacksConfig.logLevel = "none";
+
+const stx = require("@stacks/transactions");
+const c32 = require("c32check");
+const process = require('node:process');
+const fs = require('node:fs');
+
+let DEBUG = true;
+const DEFAULT_NODE = "http://seed-0.mainnet.stacks.co:20443"
+
+function debug(msg) {
+  if (DEBUG) {
+    console.error(msg);
+  }
+}
+
+const BURN_MAINNET = 'SP000000000000000000002Q6VF78';
+const BURN_TESTNET = 'ST000000000000000000002AMW42H';
+
+function getBurnAddress(mainnet) {
+  if (mainnet) {
+    return BURN_MAINNET;
+  }
+  else {
+    return BURN_TESTNET;
+  }
+}
+
+function getTxVersion(mainnet) {
+  if (mainnet) {
+    return stx_common.TransactionVersion.Mainnet;
+  }
+  else {
+    return stx_common.TransactionVersion.Testnet;
+  }
+}
+
+// argv: string[]: list of arguments to parse
+// opts: string: getopt(3)-style short options
+// longOpts: object: long option names keyed to short option characters in opts
+function getCLIOpts(argv, opts, longOpts) {
+  const optsTable = {};
+  const remainingArgv = [];
+  const argvBuff = argv.slice(0);
+
+  for (let i = 0; i < opts.length; i++) {
+    if (opts[i] == ':') {
+      continue;
+    }
+    if (i + 1 < opts.length && opts[i + 1] === ':') {
+      optsTable[opts[i]] = null;
+    } else {
+      optsTable[opts[i]] = false;
+    }
+  }
+
+  for (const opt of Object.keys(optsTable)) {
+    for (let i = 0; i < argvBuff.length; i++) {
+      if (argvBuff[i] === null) {
+        break;
+      }
+      if (argvBuff[i] === '--') {
+        break;
+      }
+
+      const argvOpt = `-${opt}`;
+      const longOptName = longOpts[opt] !== undefined ? longOpts[opt] : '';
+      const longOpt = `--${longOpts[longOptName]}`;
+      if (argvOpt === argvBuff[i] || longOpt === argvBuff[i]) {
+        if (optsTable[opt] === false) {
+          // boolean switch
+          optsTable[opt] = true;
+          argvBuff[i] = '';
+        } else {
+          // argument
+          optsTable[opt] = argvBuff[i + 1];
+          argvBuff[i] = '';
+          argvBuff[i + 1] = '';
+        }
+      }
+    }
+  }
+
+  for (let i = 0; i < argvBuff.length; i++) {
+    if (argvBuff[i].length > 0) {
+      if (argvBuff[i] === '--') {
+        continue;
+      }
+      remainingArgv.push(argvBuff[i]);
+    }
+  }
+
+  optsTable['_'] = remainingArgv;
+  return optsTable;
+}
+
+function usageEncodeCLI() {
+  console.error(
+    `Usage: ${process.argv[1]} encode type value [type value ...]\n` +
+    `Where \`type\` and \`value\` adhere to the following grammar:\n` +
+    `\n` +
+    `   Integer         = (any i128 value)\n` +
+    `   UInteger        = (any u128 value)\n` +
+    `   C32Address      = (any Crockford-32 checksum-encoded address)\n` +
+    `   HexString       = 0x, (any string that matches the regex /^[0-9a-f]$/\n` +
+    `   ClarityLiteral  = (any string that is a valid Clarity literal)\n` +
+    `   ContractName    = (any string that is a valid Clarity contract name)\n` +
+    `   ASCIIString     = "" | ", (any string made of just ASCII characters), "\n` +
+    `   UTF8String      = "" | ", (any string made of just UTF-8 codepoints), "\n` +
+    `\n` +
+    `   AddressString   = C32Address | C32Address, ContractName\n` +
+    `\n` +
+    `   Value = Integer | UInteger | C32CheckString | Boolean | HexString | ASCIIString | UTF8String \n` +
+    `\n` +
+    `   Type = "int", Integer | "uint", UInteger | "bool", Boolean | "buff", HexString |\n` +
+    `          "string-ascii", ASCIIString | "string-utf8", UTF8String | "principal", AddressString |\n` +
+    `          "some", Type | "none" | "ok", Type | "err", Type | "list", UInteger, { Type, Value } |\n` +
+    `          "tuple", UInteger, { ClarityLiteral, Type, Value }\n` +
+    `\n` +
+    `Examples:\n` +
+    ` uint 3\n` +
+    `       0100000000000000000000000000000003\n` +
+    ` principal SP1QK1AZ24R132C0D84EEQ8Y2JDHARDR58R72E1ZW\n` +
+    `       05166f30abe2260231300d411ceba3c29362ac370546\n` +
+    ` buff 0x1234\n` +
+    `       02000000021234\n` +
+    ` some buff 0xdeadbeef\n` +
+    `       0a0200000004deadbeef\n` +
+    ` ok some string-ascii "hello world"\n` +
+    `       070a0d0000000b68656c6c6f20776f726c64\n` +
+    ` list 3 uint 0 uint 1 uint 2\n` +
+    `       0b00000003010000000000000000000000000000000001000000000000000000000000000000010100000000000000000000000000000002\n` +
+    ` tuple 2 field1 int 3 field2 string-utf8 "hello world"\n` +
+    `       0c00000002066669656c64310000000000000000000000000000000003066669656c64320e0000000b68656c6c6f20776f726c64\n`
+  );
+  process.exit(1);
+}
+
+function usageDecodeCLI() {
+  console.error(
+    `Usage: ${process.argv[1]} decode clarity-buffer\n` +
+    `Where \`clarity-buffer\` is a hex-encoded string representing a Clarity value (such as one\n` +
+    `generated from the \`encode\` subcommand). The decoded value will be a JSON object.\n` +
+    `\n` +
+    `Examples:\n` +
+    ` 0100000000000000000000000000000003\n` +
+    `      {"type":"uint","value":"3"}\n` +
+    ` 05166f30abe2260231300d411ceba3c29362ac370546\n` +
+    `      {"type":"principal","value":"SP1QK1AZ24R132C0D84EEQ8Y2JDHARDR58R72E1ZW"}\n` +
+    ` 02000000021234\n` +
+    `      {"type":"buff","value":"0x1234"}\n` +
+    ` 070a0d0000000b68656c6c6f20776f726c64\n` +
+    `      {"type":"ok some string-ascii","value":{"type":"some string-ascii","value":{"type":"string-ascii","value":"hello world"}}}\n` +
+    ` 0b00000005010000000000000000000000000000000001000000000000000000000000000000010100000000000000000000000000000002\n` +
+    `      {"type":"list 3","value":[{"type":"uint","value":"0"},{"type":"uint","value":"1"},{"type":"uint","value":"2"}]}\n` +
+    ` 0c00000002066669656c64310000000000000000000000000000000003066669656c64320e0000000b68656c6c6f20776f726c64\n` +
+    `      {"type":"tuple 2","value":{"field1":{"type":"int","value":"3"},"field2":{"type":"string-utf8","value":"hello world"}}}\n`
+  );
+  process.exit(1);
+}
+
+function usageReadOnlyCall() {
+  console.error(
+    `Usage: ${process.argv[1]} read-only-call [options] contract-id function-name [args...]\n` +
+    `Where \`contract-id\` is a fully-qualified contract identifier and each item in \`args\` is a hex-\n` +
+    `encoded serialized Clarity value (which can be produced with the \`encode\` subcommand).\n` +
+    `Values for \`options\` include:\n` +
+    `   -b, --at-block      Stacks chain tip block ID at which to run this function\n` +
+    `   -n, --node          Stacks node URL. Default is ${DEFAULT_NODE}\n` +
+    `   -s, --sender        Principal that invokes this method. Can be a standard or contract principal.\n` +
+    `                       If not provided, the default is the burn address.\n` +
+    `   -t, --testnet       The target node runs on testnet.\n` +
+    `\n` +
+    `Outputs the function's return value as serialized hex-encoded Clarity value as a JSON string.`
+  );
+  process.exit(1);
+}
+
+function usageMapGet() {
+  console.error(
+    `Usage: ${process.argv[1]} map-get [options] contract-id map-name map-key\n` +
+    `Where \`contract-id\` is a fully-qualified contract identifier, \`map-name\` is the name of the\n` +
+    `map in the contract to query, and \`map-key\` is the Clarity-encoded value that is the key to \n` +
+    `query (this can be generated with the \`encode\` subcommand).\n` +
+    `Values for \`options\` include:\n` +
+    `   -b, --at-block      Stacks chain tip block ID at which to run this function\n` +
+    `   -n, --node          Stacks node URL. Default is ${DEFAULT_NODE}\n` +
+    `   -p, --proof         Request a MARF Merkle proof in the query.\n` +
+    `\n` +
+    `Outputs the map's value's Clarity-encoded representation as a JSON string, and optionally the proof.\n` +
+    `The value will always be an (optional ..), since this is what (map-get? ..) returns.\n`
+  );
+  process.exit(1);
+}
+
+function usageVarGet() {
+  console.error(
+    `Usage: ${process.argv[1]} var-get [options] contract-id var-name\n` +
+    `Where \`contract-id\` is a fully-qualified contract identifier, and \`var-name\` is the name of the\n` +
+    `variable in the contract to query.\n` +
+    `Values for \`options\` include:\n` +
+    `   -b, --at-block      Stacks chain tip block ID at which to run this function\n` +
+    `   -n, --node          Stacks node URL. Default is ${DEFAULT_NODE}\n` +
+    `   -p, --proof         Request a MARF Merkle proof in the query.\n` +
+    `\n` +
+    `Outputs the variable's Clarity-encoded representation as a JSON string, and optionally the proof.\n`
+  );
+  process.exit(1);
+}
+
+function usageTxGet() {
+  console.error(
+    `Usage: ${process.argv[1]} get-tx [options] txid\n` +
+    `Where \`txid\` is the 32-byte hex-encoded transaction ID.\n` +
+    `Values for \`options\` include:\n` +
+    `   -n, --node          Stacks node URL. Default is ${DEFAULT_NODE}\n` +
+    `\n` +
+    `Outputs the transaction and its status on the node, if it is still in the mempool.\n` +
+    `Does not work for transactions that are not in the mempool.\n`
+  );
+  process.exit(1);
+}
+
+function usageAttachmentGet() {
+  console.error(
+    `Usage: ${process.argv[1]} get-attachment [options] attachment-id\n` +
+    `Where \`attachment-id\` is the 20-byte hex-encoded attachment ID.\n` +
+    `Values for \`options\` include:\n` +
+    `   -n, --node          Stacks node URL. Default is ${DEFAULT_NODE}\n` +
+    `\n` +
+    `Outputs the attachment as a hex-encoded JSON string, if it was stored on the node.\n`
+  );
+  process.exit(1);
+}
+
+function usageContractGet() {
+  console.error(
+    `Usage: ${process.argv[1]} get-contract [options] contract-id\n` +
+    `Where \`contract-id\` is a fully-qualified contract identifier.\n` +
+    `Values for \`options\` include:\n` +
+    `   -b, --at-block      Stacks chain tip block ID at which to run this function\n` +
+    `   -n, --node          Stacks node URL. Default is ${DEFAULT_NODE}\n` +
+    `   -p, --proof         Request a MARF Merkle proof in the query.\n` +
+    `\n` +
+    `Outputs the contract source code as a JSON string, and and optionally the proof.\n`
+  );
+  process.exit(1);
+}
+
+function usageContractAPIGet() {
+  console.error(
+    `Usage: ${process.argv[1]} get-pi [options] contract-id\n` +
+    `Where \`contract-id\` is a fully-qualified contract identifier.\n` +
+    `Values for \`options\` include:\n` +
+    `   -b, --at-block      Stacks chain tip block ID at which to run this function\n` +
+    `   -n, --node          Stacks node URL. Default is ${DEFAULT_NODE}\n` +
+    `\n` +
+    `Outputs the contract's API as a JSON string.\n`
+  );
+  process.exit(1);
+}
+    
+function usageSubcommands() {
+  console.error(
+    `Usage: ${process.argv[1]} subcommand [options] args...\n` +
+    `Where \`subcommand\` is any of the following:\n` +
+    `  encode          Encode type-annotated values into a serialized Clarity value\n` +
+    `  decode          Decode a serialized Clarity buffer into its constituent values\n` +
+    `  map-get         Get a map value from a contract, given a map key\n` +
+    `  var-get         Get a data-var from a contract\n` +
+    `  get-tx          Get a transaction from the mempool\n` +
+    `  get-attachment  Get an attachment\n` +
+    `  get-contract    Get a contract's source code\n` +
+    `  get-api         Get a contract's API\n` +
+    `  read-only-call  Call a read-only contract function\n` +
+    `\n` +
+    `Run '${process.argv[1]} help subcommand' for subcommand-specific instructions.` +
+    '\n'
+  );
+  process.exit(1);
+}
+
+function doHelp(subcommand) {
+  if (subcommand === "encode") {
+    usageEncodeCLI();
+  }
+  else if (subcommand === "read-only-call") {
+    usageReadOnlyCall();
+  }
+  else {
+    console.error(`Unrecognized subcommand '${subcommand}'`);
+    usageSubcommands();
+  }
+}
+
+// Is a type atomic? i.e. it has no internal structure?
+function isAtomicType(cltype) {
+  const atomicTypes = [
+    "int",
+    "uint",
+    "bool",
+    "buff",
+    "string-ascii",
+    "string-utf8",
+    "principal"
+  ];
+  for (let type of atomicTypes) {
+    if (cltype === type) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Is a type an optional?
+function isOptionalType(cltype) {
+  const optionalTypes = [
+    "some",
+    "none"
+  ];
+  for (let type of optionalTypes) {
+    if (cltype === type) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Is a type a response
+function isResponseType(cltype) {
+  const optionalTypes = [
+    "ok",
+    "err"
+  ];
+  for (let type of optionalTypes) {
+    if (cltype === type) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Parse "atomic" type/value pair.  This is everything besides response, optional, list, and tuple
+function parseAtomTypeValue(cltype, clval) {
+  let val = undefined;
+
+  if (cltype === "int") {
+    val = stx.intCV(parseInt(clval));
+  }
+  else if (cltype === "uint") {
+    val = stx.uintCV(parseInt(clval));
+  }
+  else if (cltype === "bool") {
+    if (clval.toLowerCase() === 'true') {
+      val = stx.trueCV();
+    }
+    else if (clval.toLowerCase() === 'false') {
+      val = stx.falseCV();
+    }
+  }
+  else if (cltype === "buff") {
+    const strippedClVal = clval.startsWith('0x') ? clval.slice(2) : clval;
+    val = stx.bufferCV(Buffer.from(strippedClVal, 'hex'));
+  }
+  else if (cltype === "string-ascii") {
+    val = stx.stringAsciiCV(clval);
+  }
+  else if (cltype === "string-utf8") {
+    val = stx.stringUtf8CV(clval);
+  }
+  else if (cltype === "principal") {
+    if (clval.indexOf('.') >= 0) {
+      // contract
+      const parts = clval.split(".");
+      if (parts.length !== 2) {
+        throw new Error(`Unrecognized contract principal '${clval}'`);
+      }
+      val = stx.contractPrincipalCV(parts[0], parts[1]);
+    }
+    else {
+      // standard
+      val = stx.standardPrincipalCV(clval);
+    }
+  }
+  else {
+    throw new Error(`Not an atom type: '${cltype}'`);
+  }
+
+  return val;
+}
+
+// read the first item of clargs as a positive integer, and return it as `numItems`.
+// Check that there are `numItems` or more items remaining in clargs
+function parseLength(clargs, i) {
+  if (i >= clargs.length) {
+    throw new Error(`Out of bounds: ${i} >= ${clargs.length}`);
+  }
+  const lengthStr = clargs[i];
+  const numItems = parseInt(lengthStr);
+  if (isNaN(numItems) || numItems < 0) {
+    throw new Error(`Invalid integer '${lengthStr}'`);
+  }
+  if (numItems === 0) {
+    const ret = {
+      numItems: 0,
+      i: i + 1
+    }
+    return ret;
+  }
+  if (clargs.length <= i + 1) {
+    throw new Error(`Unable to parse at '${i}': out of tokens`);
+  }
+  if (clargs.length <= i + 1 + numItems) {
+    throw new Error(`Unable to continue parsing: fewer items (${clargs.length - i}) than indicated (${numItems})`);
+  }
+  const ret = {
+    numItems: numItems,
+    i: i + 1,
+  };
+  return ret;
+}
+
+// Parse a list.
+// Format is ["$number"] + [cltype, clarg] * $number
+// all `cltype` fields must be the same type
+function parseList(clargs, i) {
+  const listLength = parseLength(clargs, i);
+  const numItems = listLength.numItems;
+  i = listLength.i;
+  if (numItems === 0) {
+    const ret = {
+      type: `list empty`,
+      value: stx.listCV([]),
+      i: i
+    };
+    return ret;
+  }
+
+  let lastType = undefined;
+  let val = [];
+  for (let cnt = 0; cnt < numItems; cnt++) {
+    const next = parseTypeValues(clargs, i);
+    if (!!lastType && next.type !== lastType) {
+      const nextTypePrefix = next.type.split(' ')[0];
+      const lastTypePrefix = lastType.split(' ')[0];
+      if ((isOptionalType(nextTypePrefix) && !isOptionalType(lastTypePrefix)) ||
+          (!isOptionalType(nextTypePrefix) && isOptionalType(lastTypePrefix))) {
+        throw new Error(`Invalid list: '${lastType}' != '${next.type}'`);
+      }
+      if ((isResponseType(nextTypePrefix) && !isResponseType(lastTypePrefix)) ||
+          (!isResponseType(nextTypePrefix) && isResponseType(lastTypePrefix))) {
+        throw new Error(`Invalid list: '${lastType}' != '${next.type}'`);
+      }
+    }
+    i = next.i;
+    lastType = next.type;
+    val.push(next.value);
+  }
+
+  const ret = {
+    type: `list ${lastType}`,
+    value: stx.listCV(val),
+    i: i,
+  };
+  return ret;
+}
+
+// Parse an optional
+// Format is ["none"] or ["some" ...]
+function parseOptional(clargs, i) {
+  if (clargs.length <= i) {
+    throw new Error(`Unable to parse optional at ${i}`);
+  }
+  if (clargs[i] === "none") {
+    const ret = {
+      type: "none",
+      value: stx.noneCV(),
+      i: i + 1
+    };
+    return ret;
+  }
+  else if (clargs[i] === "some") {
+    if (clargs.length <= i + 1) {
+      throw new Error(`Unable to parse (some ..) optional at ${i}`);
+    }
+    const inner = parseTypeValues(clargs, i+1);
+    const ret = {
+      type: `some ${inner.type}`,
+      value: stx.someCV(inner.value),
+      i: inner.i
+    };
+    return ret;
+  }
+  else {
+    throw new Error(`Unrecognized optional constructor '${clargs[i]}' at ${i}`);
+  }
+}
+
+// Parse a response
+// Format is ["ok" ...] or ["err" ...]
+function parseResponse(clargs, i) {
+  if (clargs.length <= i + 1) {
+    throw new Error(`Unable to parse response at ${i}`);
+  }
+  if (clargs[i] === "ok") {
+    const inner = parseTypeValues(clargs, i+1);
+    const ret = {
+      type: `ok ${inner.type}`,
+      value: stx.responseOkCV(inner.value),
+      i: inner.i
+    };
+    return ret;
+  }
+  else if (clargs[i] === "err") {
+    const inner = parseTypeValues(clargs, i+1);
+    const ret = {
+      type: `err ${inner.type}`,
+      value: stx.responseErrorCV(inner.value),
+      i: inner.i
+    };
+    return ret;
+  }
+  else {
+    throw new Error(`Unrecognized response constructor '${clargs[i]}'`);
+  }
+}
+
+// Parse a tuple
+// Format is ["$num_keys"] + ["key1" "type1" "value1" "key2" "type2" "value2" ...]
+function parseTuple(clargs, i) {
+  const keyLength = parseLength(clargs, i);
+  const numItems = keyLength.numItems;
+  if (clargs.length <= i + 3 * numItems) {
+    throw new Error(`Unable to parse tuple at ${i}: not enough tokens`);
+  }
+
+  i = keyLength.i;
+  let key_types = [];
+  let value = {};
+  for (let cnt = 0; cnt < numItems; cnt++) {
+    if (clargs.length <= i + 2) {
+      throw new Error(`Unable to parse tuple entry at ${i}: out of tokens`);
+    }
+
+    const keyName = clargs[i];
+    const keyType = clargs[i+1];
+
+    key_types.push(`${keyName}:${keyType}`);
+    const inner = parseTypeValues(clargs, i+1);
+    value[keyName] = inner.value;
+    i = inner.i;
+  }
+  key_types.sort();
+  const ret = {
+    type: `tuple ${JSON.stringify(key_types)}`,
+    value: stx.tupleCV(value),
+    i: i
+  };
+  return ret;
+}
+
+// Parse any clarity type in clargs, starting at index i
+function parseTypeValues(clargs, i) {
+  if (clargs.length <= i) {
+    throw new Error(`Unable to parse type values: out of tokens`);
+  }
+  if (isAtomicType(clargs[i])) {
+    if (clargs.length <= i + 1) {
+      throw new Error(`Unable to parse atomic at ${i}: out of tokens`);
+    }
+    let val = parseAtomTypeValue(clargs[i], clargs[i+1]);
+    const ret = {
+      type: clargs[i],
+      value: val,
+      i: i + 2
+    };
+    return ret;
+  }
+  else if (isOptionalType(clargs[i])) {
+    return parseOptional(clargs, i);
+  }
+  else if (isResponseType(clargs[i])) {
+    return parseResponse(clargs, i);
+  }
+  else if (clargs[i] === "list") {
+    return parseList(clargs, i+1);
+  }
+  else if (clargs[i] === "tuple") {
+    return parseTuple(clargs, i+1);
+  }
+  else {
+    throw new Error(`Unrecognized type ${clargs[i]}`);
+  }
+}
+
+// Call a read-only function 
+// function_args must be a list of hex-encoded serialized clarity strings
+async function readOnlyContractCall(node, contract_addr, contract_name, function_name, function_args, mainnet, sender, tip) {
+  let url = `${node}/v2/contracts/call-read/${contract_addr}/${contract_name}/${function_name}`;
+  if (!!tip) {
+    url = `${url}?tip=${tip}`;
+  }
+  const body = {
+    sender: sender,
+    arguments: function_args
+  };
+
+  let res;
+  let data;
+
+  try {
+    res = await fetch(url, {
+      method: 'post',
+      body: JSON.stringify(body),
+      headers: { 'content-type': 'application/json' }
+    });
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+  
+  if (!res.ok) {
+    console.error(`HTTP ${res.status}: ${await res.text()}`);
+    return undefined;
+  }
+
+  try {
+    data = await res.json();
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+
+  const encodedCV = data.result;
+  return encodedCV.toString('hex');
+}
+
+// Get a map entry
+async function getMapEntry(node, contract_addr, contract_name, map_name, map_key, tip, proof) {
+  let qsv = [];
+  if (!!tip) {
+    qsv.push(`tip=${tip}`);
+  }
+  if (!!proof) {
+    qsv.push(`proof=1`);
+  }
+  else {
+    qsv.push(`proof=0`);
+  }
+
+  let qs = qsv.length === 0 ? "" : `?${qsv.join("&")}`;
+
+  const url = `${node}/v2/map_entry/${contract_addr}/${contract_name}/${map_name}${qs}`;
+  const body = JSON.stringify(map_key);
+
+  let res;
+  let data;
+
+  try {
+    res = await fetch(url, {
+      method: 'post',
+      body: body,
+      headers: { 'content-type': 'application/json' }
+    });
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+  
+  if (!res.ok) {
+    console.error(`HTTP ${res.status}: ${await res.text()}`);
+    return undefined;
+  }
+
+  try {
+    data = await res.json();
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+
+  return data;
+}
+
+// Get a data var
+async function getDataVar(node, contract_addr, contract_name, var_name, tip, proof) {
+  let qsv = [];
+  if (!!tip) {
+    qsv.push(`tip=${tip}`);
+  }
+  if (!!proof) {
+    qsv.push(`proof=1`);
+  }
+  else {
+    qsv.push(`proof=0`);
+  }
+  let qs = qsv.length === 0 ? "" : `?${qsv.join("&")}`;
+
+  const url = `${node}/v2/data_var/${contract_addr}/${contract_name}/${var_name}${qs}`;
+
+  let res;
+  let data;
+
+  try {
+    res = await fetch(url, {
+      method: 'get',
+      headers: { 'content-type': 'application/json' }
+    });
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+  
+  if (!res.ok) {
+    console.error(`HTTP ${res.status}: ${await res.text()}`);
+    return undefined;
+  }
+
+  try {
+    data = await res.json();
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+
+  return data;
+}
+
+// Get a mempool or microblock stream tx
+async function getTx(node, txid) {
+  const url = `${node}/v2/transactions/unconfirmed/${txid}`;
+
+  let res;
+  let data;
+
+  try {
+    res = await fetch(url, {
+      method: 'get',
+    });
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+
+  if (!res.ok) {
+    console.error(`HTTP ${res.status}: ${await res.text()}`);
+    return undefined;
+  }
+
+  try {
+    data = await res.json();
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+
+  return data;
+}
+
+// Get an attachment
+async function getAttachment(node, attachmentId) {
+  const url = `${node}/v2/attachments/${attachmentId}`;
+
+  let res;
+  let data;
+
+  try {
+    res = await fetch(url, {
+      method: 'get',
+    });
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+  
+  if (!res.ok) {
+    console.error(`HTTP ${res.status}: ${await res.text()}`);
+    return undefined;
+  }
+
+  try {
+    data = await res.json();
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+
+  return data;
+}
+
+// Get contract
+async function getContract(node, address, contractName, attachmentId, tip, proof) {
+  let qsv = [];
+  if (!!tip) {
+    qsv.push(`tip=${tip}`);
+  }
+  if (!!proof) {
+    qsv.push(`proof=1`);
+  }
+  else {
+    qsv.push(`proof=0`);
+  }
+  let qs = qsv.length === 0 ? "" : `?${qsv.join("&")}`;
+  const url = `${node}/v2/contracts/source/${address}/${contractName}${qs}`;
+
+  let res;
+  let data;
+
+  try {
+    res = await fetch(url, {
+      method: 'get',
+    });
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+  
+  if (!res.ok) {
+    console.error(`HTTP ${res.status}: ${await res.text()}`);
+    return undefined;
+  }
+
+  try {
+    data = await res.json();
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+
+  return data;
+}
+
+// Get contract API
+async function getContractAPI(node, address, contractName, attachmentId, tip) {
+  let qsv = [];
+  if (!!tip) {
+    qsv.push(`tip=${tip}`);
+  }
+  let qs = qsv.length === 0 ? "" : `?${qsv.join("&")}`;
+  const url = `${node}/v2/contracts/interface/${address}/${contractName}${qs}`;
+
+  let res;
+  let data;
+
+  try {
+    res = await fetch(url, {
+      method: 'get',
+    });
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+  
+  if (!res.ok) {
+    console.error(`HTTP ${res.status}: ${await res.text()}`);
+    return undefined;
+  }
+
+  try {
+    data = await res.json();
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+
+  return data;
+}
+
+// Encode a Clarity value
+function encodeClarityValue(clargs) {
+  const res = parseTypeValues(clargs, 0);
+  if (res.i !== clargs.length) {
+    throw new Error(`Did not encode all values: stopped at item ${i} out of ${clargs.length}`);
+  }
+  const value = res.value;
+  return stx.serializeCV(value).toString('hex');
+}
+
+function typeIdToString(typeId) {
+  if (typeId === 0) {
+    return 'int';
+  }
+  if (typeId === 1) {
+    return 'uint';
+  }
+  if (typeId === 2) {
+    return 'buff';
+  }
+  if (typeId === 3) {
+    return 'bool';
+  }
+  if (typeId === 4) {
+    return 'bool';
+  }
+  if (typeId === 5) {
+    return 'principal';
+  }
+  if (typeId === 6) {
+    return 'principal';
+  }
+  if (typeId === 7) {
+    return 'ok';
+  }
+  if (typeId === 8) {
+    return 'err';
+  }
+  if (typeId === 9) {
+    return 'none';
+  }
+  if (typeId === 10) {
+    return 'some';
+  }
+  if (typeId === 11) {
+    return 'list';
+  }
+  if (typeId === 12) {
+    return 'tuple';
+  }
+  if (typeId === 13) {
+    return 'string-ascii';
+  }
+  if (typeId === 14) {
+    return 'string-utf8';
+  }
+  throw new Error(`Unrecognized type ID ${typeId}`);
+}
+
+function atomicValueToString(typeId, ptr) {
+  if (typeId === 0 || typeId === 1) {
+    // int, uint -- these are bn.js
+    return ptr.value.toString();
+  }
+  if (typeId == 2) {
+    // buffer
+    return `0x${ptr.buffer.toString('hex')}`;
+  }
+  if (typeId === 3) {
+    return 'true';
+  }
+  if (typeId === 4) {
+    return 'false';
+  }
+  if (typeId === 5) {
+    return c32.c32address(ptr.address.version, ptr.address.hash160);
+  }
+  if (typeId === 6) {
+    return `${c32.c32address(ptr.address.version, ptr.address.hash160)}.${ptr.contractName.content}`;
+  }
+  if (typeId === 13 || typeId === 14) {
+    return ptr.data;
+  }
+  throw new Error(`Not an atomic type ID: ${typeId}`);
+}
+
+function innerDecodeClarityValue(ptr) {
+  const typeStr = typeIdToString(ptr.type);
+  if (isAtomicType(typeStr)) {
+    const ret = {
+      type: typeStr,
+      value: atomicValueToString(ptr.type, ptr)
+    };
+    return ret;
+  }
+  else {
+    if (typeStr === 'none') {
+      const ret = {
+        type: typeStr,
+        value: null
+      };
+      return ret;
+    }
+    else if (typeStr === 'ok' || typeStr === 'err' || typeStr === 'some') {
+      const inner = innerDecodeClarityValue(ptr.value);
+      const ret = {
+        type: `${typeStr} ${inner.type}`,
+        value: inner
+      };
+      return ret;
+    }
+    else if (typeStr === 'list') {
+      const innerList = ptr.list.map(function (item) {
+        return innerDecodeClarityValue(item);
+      });
+      const ret = {
+        type: `list ${innerList.length}`,
+        value: innerList
+      };
+      return ret;
+    }
+    else if (typeStr === 'tuple') {
+      let inner = {};
+      for (let key of Object.keys(ptr.data)) {
+        inner[key] = innerDecodeClarityValue(ptr.data[key]);
+      }
+      const ret = {
+        type: `tuple ${Object.keys(inner).length}`,
+        value: inner
+      };
+      return ret;
+    }
+    else {
+      throw new Error(`Unrecognized type ${typeStr}`);
+    }
+  }
+}
+
+// Decode a Clarity value
+function decodeClarityValue(cvhex) {
+  if (cvhex.slice(2) === '0x') {
+    cvhex = cvhex.slice(2);
+  }
+  const cvobj = stx.deserializeCV(cvhex);
+  return innerDecodeClarityValue(cvobj);
+}
+
+// CLI subcommand for encoding clarity values
+function encodeCLI(argv) {
+  const opts = getCLIOpts(argv, "", {});
+  const clargs = opts['_'];
+  if (clargs.length === 0) {
+    usageEncodeCLI();
+  }
+  return encodeClarityValue(clargs);
+}
+
+// CLI subcommand for decoding clarity values
+function decodeCLI(argv) {
+  const opts = getCLIOpts(argv, "", {});
+  const clargs = opts['_'];
+  if (clargs.length !== 1) {
+    usageDecodeCLI();
+  }
+  return decodeClarityValue(clargs[0]);
+}
+
+// CLI subcommand for doing a read-only RPC
+async function readOnlyCallCLI(argv) {
+  const opts = getCLIOpts(argv, "n:ts:b:", {
+    "n": "node",
+    "t": "testnet",
+    "s": "tx-sender",
+    "b": "at-block"
+  });
+
+  const mainnet = !opts['t'];
+  let sender = opts['s'];
+  let node = opts['n'];
+  const tip = opts['b'];
+  if (sender === null) {
+    sender = getBurnAddress(mainnet);
+  }
+  if (node === null) {
+    node = DEFAULT_NODE;
+  }
+  const args = opts['_'];
+  if (args.length < 2) {
+    usageReadOnlyCall();
+  }
+  const contractAddr = args[0];
+  const funcName = args[1];
+  const funcArgs = args.slice(2)
+    .map(function(arg) {
+      // trim " on beginning/end, since the caller might have just passed a JSON value in from `encode`
+      return arg.replace(/^"/, "").replace(/"$/, "");
+    });
+
+  try {
+    // sender must be well-formed
+    parseAtomTypeValue("principal", sender);
+  }
+  catch(e) {
+    console.error(`Invalid sender '${sender}'`);
+    process.exit(1);
+  };
+  try {
+    // contract must be well-formed
+    parseAtomTypeValue("principal", contractAddr);
+  }
+  catch(e) {
+    console.error(`Invalid contract '${contractAddr}'`);
+    process.exit(1);
+  };
+
+  const contractParts = contractAddr.split(".");
+  if (contractParts.length !== 2) {
+    console.error(`Invalid contract address '${contractAddr}': wrong number of '.'s`);
+    process.exit(1);
+  }
+
+  const res = await readOnlyContractCall(node, contractParts[0], contractParts[1], funcName, funcArgs, mainnet, sender, tip);
+  return res;
+}
+
+// CLI subcommand for doing a map-get
+async function mapGetCLI(argv) {
+  const opts = getCLIOpts(argv, "n:b:p", {
+    "n": "node",
+    "b": "at-block",
+    "p": "proof"
+  });
+
+  let node = opts['n'];
+  const tip = opts['b'];
+  const proof = opts['p'];
+  if (node === null) {
+    node = DEFAULT_NODE;
+  }
+  const args = opts['_'];
+  if (args.length < 3) {
+    usageMapGet();
+  }
+  const contractAddr = args[0];
+  const mapName = args[1];
+  const mapKey = args[2].replace(/^"/, "").replace(/"$/, "");
+
+  try {
+    // contract must be well-formed
+    parseAtomTypeValue("principal", contractAddr);
+  }
+  catch(e) {
+    console.error(`Invalid contract '${contractAddr}'`);
+    process.exit(1);
+  };
+
+  const contractParts = contractAddr.split(".");
+  if (contractParts.length !== 2) {
+    console.error(`Invalid contract address '${contractAddr}': wrong number of '.'s`);
+    process.exit(1);
+  }
+  try {
+    // map key must be a CV
+    stx.deserializeCV(mapKey);
+  }
+  catch(e) {
+    console.error(`Invalid map key '${mapKey}'`);
+    process.exit(1);
+  }
+
+  const res = await getMapEntry(node, contractParts[0], contractParts[1], mapName, mapKey, tip, proof);
+  return res;
+}
+
+// CLI subcommand for doing a var-get
+async function varGetCLI(argv) {
+  const opts = getCLIOpts(argv, "n:b:p", {
+    "n": "node",
+    "b": "at-block",
+    "p": "proof"
+  });
+
+  let node = opts['n'];
+  const tip = opts['b'];
+  const proof = opts['p'];
+  if (node === null) {
+    node = DEFAULT_NODE;
+  }
+  const args = opts['_'];
+  if (args.length < 2) {
+    usageVarGet();
+  }
+  const contractAddr = args[0];
+  const varName = args[1];
+
+  try {
+    // contract must be well-formed
+    parseAtomTypeValue("principal", contractAddr);
+  }
+  catch(e) {
+    console.error(`Invalid contract '${contractAddr}'`);
+    process.exit(1);
+  };
+
+  const contractParts = contractAddr.split(".");
+  if (contractParts.length !== 2) {
+    console.error(`Invalid contract address '${contractAddr}': wrong number of '.'s`);
+    process.exit(1);
+  }
+
+  const res = await getDataVar(node, contractParts[0], contractParts[1], varName, tip, proof);
+  return res;
+}
+
+// CLI subcommand for getting an unconfirmed tx
+async function txGetCLI(argv) {
+  const opts = getCLIOpts(argv, "n:", {
+    "n": "node",
+  });
+
+  let node = opts['n'];
+  const args = opts['_'];
+  if (args.length < 1) {
+    usageTxGet();
+  }
+  let txid = args[0];
+  if (txid.slice(0,2) === "0x") {
+    txid = txid.slice(2);
+  }
+
+  const res = await getTx(node, txid);
+  return res;
+}
+
+// CLI subcommand for getting an attachment
+async function attachmentGetCLI(argv) {
+  const opts = getCLIOpts(argv, "n:", {
+    "n": "node",
+  });
+
+  let node = opts['n'];
+  const raw = opts['r'];
+  const args = opts['_'];
+  if (args.length < 1) {
+    usageAttachmentGet();
+  }
+  let attachmentId = args[0];
+  if (attachmentId.slice(0,2) === "0x") {
+    attachmentId = attachmentId.slice(2);
+  }
+
+  const res = await getAttachment(node, attachmentId);
+  return res;
+}
+
+// CLI subcommand for getting a contract
+async function contractGetCLI(argv) {
+  const opts = getCLIOpts(argv, "n:b:p", {
+    "n": "node",
+    "b": "at-block",
+    "p": "proof"
+  });
+
+  let node = opts['n'];
+  const tip = opts['b'];
+  const proof = opts['p'];
+  if (node === null) {
+    node = DEFAULT_NODE;
+  }
+  const args = opts['_'];
+  if (args.length !== 1) {
+    usageContractGet();
+  }
+  const contractAddr = args[0];
+
+  try {
+    // contract must be well-formed
+    parseAtomTypeValue("principal", contractAddr);
+  }
+  catch(e) {
+    console.error(`Invalid contract '${contractAddr}'`);
+    process.exit(1);
+  };
+
+  const contractParts = contractAddr.split(".");
+  if (contractParts.length !== 2) {
+    console.error(`Invalid contract address '${contractAddr}': wrong number of '.'s`);
+    process.exit(1);
+  }
+
+  const res = await getContract(node, contractParts[0], contractParts[1], tip, proof);
+  return res;
+}
+
+function printOrExit(res) {
+  if (res !== undefined) {
+    console.log(JSON.stringify(res));
+  }
+  else {
+    process.exit(1);
+  }
+}
+
+// CLI subcommand for getting a contract's API
+async function contractGetInterfaceCLI(argv) {
+  const opts = getCLIOpts(argv, "n:b:", {
+    "n": "node",
+    "b": "at-block",
+  });
+
+  let node = opts['n'];
+  const tip = opts['b'];
+  if (node === null) {
+    node = DEFAULT_NODE;
+  }
+  const args = opts['_'];
+  if (args.length !== 1) {
+    usageContractAPIGet();
+  }
+  const contractAddr = args[0];
+
+  try {
+    // contract must be well-formed
+    parseAtomTypeValue("principal", contractAddr);
+  }
+  catch(e) {
+    console.error(`Invalid contract '${contractAddr}'`);
+    process.exit(1);
+  };
+
+  const contractParts = contractAddr.split(".");
+  if (contractParts.length !== 2) {
+    console.error(`Invalid contract address '${contractAddr}': wrong number of '.'s`);
+    process.exit(1);
+  }
+
+  const res = await getContractAPI(node, contractParts[0], contractParts[1], tip);
+  return res;
+}
+
+function printOrExit(res) {
+  if (res !== undefined) {
+    console.log(JSON.stringify(res));
+  }
+  else {
+    process.exit(1);
+  }
+}
+
+async function main() {
+  const argv = process.argv.slice(1);
+  const subcommand = argv[1];
+  if (subcommand === "encode") {
+    const res = encodeCLI(argv.slice(2));
+    printOrExit(res);
+  }
+  else if (subcommand === "decode") {
+    const res = decodeCLI(argv.slice(2));
+    printOrExit(res);
+  }
+  else if (subcommand === "map-get") {
+    const res = await mapGetCLI(argv.slice(2));
+    printOrExit(res);
+  }
+  else if (subcommand === "var-get") {
+    const res = await varGetCLI(argv.slice(2));
+    printOrExit(res);
+  }
+  else if (subcommand === "get-tx") {
+    const res = await txGetCLI(argv.slice(2));
+    printOrExit(res);
+  }
+  else if (subcommand === "get-attachment") {
+    const res = await attachmentGetCLI(argv.slice(2));
+    printOrExit(res);
+  }
+  else if (subcommand === "get-contract") {
+    const res = await contractGetCLI(argv.slice(2));
+    printOrExit(res);
+  }
+  else if (subcommand === "get-api") {
+    const res = await contractGetInterfaceCLI(argv.slice(2));
+    printOrExit(res);
+  }
+  else if (subcommand === "read-only-call") {
+    const res = await readOnlyCallCLI(argv.slice(2));
+    printOrExit(res);
+  }
+  else if (subcommand === "help") {
+    doHelp(argv[2]);
+  }
+  else {
+    usageSubcommands();
+  }
+}
+
+main()
+///////////////////////////////////////////////////////////////////////////////////////////////////
+/*
+testAtomicParse();
+testListParse();
+testOptionalParse();
+testResponseParse();
+testTupleParse();
+testParseTypeValues();
+
+function assert_veq(v1, v2) {
+  const s1 = stx.cvToHex(v1);
+  const s2 = stx.cvToHex(v2);
+  if (s1 !== s2) {
+    console.error(v1);
+    console.error(v2);
+    console.error(s1);
+    console.error(s2);
+    throw new Error("Assertion failed");
+  }
+}
+
+function assert_eq(v1, v2) {
+  if (v1 !== v2) {
+    console.error(v1);
+    console.error(v2);
+    throw new Error("Assertion failed");
+  }
+}
+
+function assert(b) {
+  if (!b) {
+    throw new Error("Assertion failed");
+  }
+}
+
+function testAtomicParse() {
+  assert_veq(parseAtomTypeValue("uint", "1"), stx.uintCV(1));
+  assert_veq(parseAtomTypeValue("int", "1"), stx.intCV(1));
+  assert_veq(parseAtomTypeValue("bool", "true"), stx.trueCV());
+  assert_veq(parseAtomTypeValue("bool", "false"), stx.falseCV());
+  assert_veq(parseAtomTypeValue("string-ascii", "asdf"), stx.stringAsciiCV("asdf"));
+  assert_veq(parseAtomTypeValue("string-utf8", "asdf"), stx.stringUtf8CV("asdf"));
+  assert_veq(parseAtomTypeValue("buff", "0x1234"), stx.bufferCV(Buffer.from("1234", "hex")));
+  assert_veq(parseAtomTypeValue("buff", "1234"), stx.bufferCV(Buffer.from("1234", "hex")));
+  assert_veq(parseAtomTypeValue("principal", "SP2JXKMSH007NPYAQHKJPQMAQYAD90NQGTVJVQ02B"), stx.standardPrincipalCV("SP2JXKMSH007NPYAQHKJPQMAQYAD90NQGTVJVQ02B"));
+  assert_veq(parseAtomTypeValue("principal", "SP2JXKMSH007NPYAQHKJPQMAQYAD90NQGTVJVQ02B.contract"), stx.contractPrincipalCV("SP2JXKMSH007NPYAQHKJPQMAQYAD90NQGTVJVQ02B", "contract"));
+}
+
+function testListParse() {
+  let v;
+  v = parseList(["3", "uint", "1", "uint", "2", "uint", "3"], 0);
+  assert_veq(v.value, stx.listCV([stx.uintCV(1), stx.uintCV(2), stx.uintCV(3)]));
+  assert_eq(v.i, 7);
+
+  v = parseList(["0"], 0);
+  assert_veq(v.value, stx.listCV([]));
+  assert_eq(v.i, 1);
+}
+
+function testOptionalParse() {
+  let v;
+  v = parseOptional(["none"], 0);
+  assert_veq(v.value, stx.noneCV());
+
+  v = parseOptional(["some", "uint", "1"], 0);
+  assert_veq(v.value, stx.someCV(stx.uintCV(1)));
+
+  v = parseOptional(["some", "list", "3", "uint", "1", "uint", "2", "uint", "3"], 0)
+  assert_veq(v.value, stx.someCV(stx.listCV([stx.uintCV(1), stx.uintCV(2), stx.uintCV(3)])));
+  
+  v = parseOptional(["some", "list", "6", "some", "uint", "1", "none", "some", "uint", "2", "none", "some", "uint", "3", "none"], 0)
+  assert_veq(v.value, stx.someCV(stx.listCV([stx.someCV(stx.uintCV(1)), stx.noneCV(), stx.someCV(stx.uintCV(2)), stx.noneCV(), stx.someCV(stx.uintCV(3)), stx.noneCV()])));
+
+  v = parseOptional(["some", "some", "some", "none"], 0);
+  assert_veq(v.value, stx.someCV(stx.someCV(stx.someCV(stx.noneCV()))));
+}
+
+function testResponseParse() {
+  let v;
+  v = parseResponse(["ok", "uint", "1"], 0);
+  assert_veq(v.value, stx.responseOkCV(stx.uintCV(1)));
+  
+  v = parseResponse(["err", "uint", "1"], 0);
+  assert_veq(v.value, stx.responseErrorCV(stx.uintCV(1)));
+
+  v = parseResponse(["ok", "ok", "ok", "ok", "ok", "uint", "1"], 0)
+  assert_veq(v.value, stx.responseOkCV(stx.responseOkCV(stx.responseOkCV(stx.responseOkCV(stx.responseOkCV(stx.uintCV(1)))))));
+
+  v = parseResponse(["err", "list", "5", "ok", "uint", "1", "err", "none", "ok", "uint", "2", "err", "some", "uint", "3", "ok", "uint", "3"], 0)
+  assert_veq(v.value, stx.responseErrorCV(stx.listCV([stx.responseOkCV(stx.uintCV(1)), stx.responseErrorCV(stx.noneCV()), stx.responseOkCV(stx.uintCV(2)), stx.responseErrorCV(stx.someCV(stx.uintCV(3))), stx.responseOkCV(stx.uintCV(3))])));
+}
+
+function testTupleParse() {
+  let v;
+  v = parseTuple(["3", "a", "uint", "1", "b", "string-ascii", "hello-world", "c", "buff", "0x1234"], 0);
+  assert_veq(v.value, stx.tupleCV({a: stx.uintCV(1), b: stx.stringAsciiCV("hello-world"), c: stx.bufferCV(Buffer.from("1234", "hex"))}));
+
+  v = parseTuple(["1", "a", "list", "1", "ok", "some", "uint", "1"], 0);
+  assert_veq(v.value, stx.tupleCV({a: stx.listCV([stx.responseOkCV(stx.someCV(stx.uintCV(1)))])}));
+
+  v = parseTuple(["3",
+    "a",
+      "some",
+        "tuple", "3",
+          "a", "some",
+            "uint", "1",
+          "b", "none",
+          "c", "list", "3",
+            "uint", "1", "uint", "2", "uint", "3",
+    "b",
+      "list", "1",
+        "tuple", "1",
+          "ba", "ok",
+            "uint", "3",
+    "c",
+      "string-ascii", "hello world"
+  ], 0);
+  assert_veq(v.value,
+    stx.tupleCV({
+      a: stx.someCV(
+        stx.tupleCV({
+          a: stx.someCV(
+            stx.uintCV(1)
+          ),
+          b: stx.noneCV(),
+          c: stx.listCV([
+            stx.uintCV(1),
+            stx.uintCV(2),
+            stx.uintCV(3)
+          ])
+        })
+      ),
+      b: stx.listCV([
+        stx.tupleCV({
+          ba: stx.responseOkCV(
+            stx.uintCV(3)
+          )
+        })
+      ]),
+      c: stx.stringAsciiCV("hello world")
+    })
+  );
+}
+
+function testParseTypeValues() {
+  let v;
+  v = parseTypeValues([
+    "tuple", "3",
+      "a",
+        "some",
+          "tuple", "3",
+            "a", "some",
+              "uint", "1",
+            "b", "none",
+            "c", "list", "3",
+              "uint", "1", "uint", "2", "uint", "3",
+      "b",
+        "list", "1",
+          "tuple", "1",
+            "ba", "ok",
+              "uint", "3",
+      "c",
+        "string-ascii", "hello world"
+    ], 0);
+  assert_veq(v.value,
+    stx.tupleCV({
+      a: stx.someCV(
+        stx.tupleCV({
+          a: stx.someCV(
+            stx.uintCV(1)
+          ),
+          b: stx.noneCV(),
+          c: stx.listCV([
+            stx.uintCV(1),
+            stx.uintCV(2),
+            stx.uintCV(3)
+          ])
+        })
+      ),
+      b: stx.listCV([
+        stx.tupleCV({
+          ba: stx.responseOkCV(
+            stx.uintCV(3)
+          )
+        })
+      ]),
+      c: stx.stringAsciiCV("hello world")
+    })
+  );
+}
+*/

@@ -10,6 +10,7 @@ const stx = require("@stacks/transactions");
 const c32 = require("c32check");
 const process = require('node:process');
 const fs = require('node:fs');
+const walletSdk = require('@stacks/wallet-sdk');
 
 let DEBUG = true;
 const DEFAULT_NODE = "http://seed-0.mainnet.stacks.co:20443"
@@ -255,7 +256,7 @@ function usageContractGet() {
 
 function usageContractAPIGet() {
   console.error(
-    `Usage: ${process.argv[1]} get-pi [options] contract-id\n` +
+    `Usage: ${process.argv[1]} get-api [options] contract-id\n` +
     `Where \`contract-id\` is a fully-qualified contract identifier.\n` +
     `Values for \`options\` include:\n` +
     `   -b, --at-block      Stacks chain tip block ID at which to run this function\n` +
@@ -265,20 +266,42 @@ function usageContractAPIGet() {
   );
   process.exit(1);
 }
+
+function usageAccountGet() {
+  console.error(
+    `Usage: ${process.argv[1]} get-account [options] address\n` +
+    `Where \`address\` is a standard or contract principal.\n` +
+    `Values for \'options\' include:\n` +
+    `   -b, --at-block      Stacks chain tip block ID at which to run this function\n` +
+    `   -n, --node          Stacks node URL. Default is ${DEFAULT_NODE}\n` +
+    `\n` +
+    `Outputs the account balance, locked tokens, unlock height, and nonce.\n`
+  );
+  process.exit(1);
+}
+
     
 function usageSubcommands() {
   console.error(
     `Usage: ${process.argv[1]} subcommand [options] args...\n` +
     `Where \`subcommand\` is any of the following:\n` +
-    `  encode          Encode type-annotated values into a serialized Clarity value\n` +
-    `  decode          Decode a serialized Clarity buffer into its constituent values\n` +
-    `  map-get         Get a map value from a contract, given a map key\n` +
-    `  var-get         Get a data-var from a contract\n` +
-    `  get-tx          Get a transaction from the mempool\n` +
-    `  get-attachment  Get an attachment\n` +
-    `  get-contract    Get a contract's source code\n` +
-    `  get-api         Get a contract's API\n` +
-    `  read-only-call  Call a read-only contract function\n` +
+    `  Clarity codec\n` +
+    `    encode          Encode type-annotated values into a serialized Clarity value\n` +
+    `    decode          Decode a serialized Clarity buffer into its constituent values\n` +
+    `\n` +
+    `  Chainstate\n` +
+    `    get-account     Get an account\n` +
+    `    get-attachment  Get an attachment\n` +
+    `    get-contract    Get a contract's source code\n` +
+    `    map-get         Get a map value from a contract, given a map key\n` +
+    `    var-get         Get a data-var from a contract\n` +
+    `\n` +
+    `  Mempool\n` +
+    `    get-tx          Get a transaction from the mempool\n` +
+    `\n` +
+    `  API\n` +
+    `    get-api         Get a contract's API\n` +
+    `    read-only-call  Call a read-only contract function\n` +
     `\n` +
     `Run '${process.argv[1]} help subcommand' for subcommand-specific instructions.` +
     '\n'
@@ -290,8 +313,32 @@ function doHelp(subcommand) {
   if (subcommand === "encode") {
     usageEncodeCLI();
   }
+  else if (subcommand === "decode") {
+    usageDecodeCLI();
+  }
+  else if (subcommand === "get-api") {
+    usageContractAPIGet();
+  }
+  else if (subcommand === "get-account") {
+    usageAccountGet();
+  }
+  else if (subcommand === "get-attachment") {
+    usageAttachmentGet();
+  }
+  else if (subcommand === "get-contract") {
+    usageContractGet();
+  }
+  else if (subcommand === "get-tx") {
+    usageTxGet();
+  }
+  else if (subcommand === "map-get") {
+    usageMapGet();
+  }
   else if (subcommand === "read-only-call") {
     usageReadOnlyCall();
+  }
+  else if (subcommand === "var-get") {
+    usageVarGet();
   }
   else {
     console.error(`Unrecognized subcommand '${subcommand}'`);
@@ -1033,6 +1080,55 @@ function decodeClarityValue(cvhex) {
   return innerDecodeClarityValue(cvobj);
 }
 
+// Go get an account.
+// Returns:
+// { balance: bitint, locked: bigint, unlock_height: bigint, nonce: bigint }
+async function getAccount(node, address, tip) {
+  let url = `${node}/v2/accounts/${address}?proof=0`;
+  if (!!tip) {
+    url = `${url}&tip=${tip}`;
+  }
+
+  let res;
+  let data;
+
+  try {
+    res = await fetch(url, {
+      method: 'get',
+    });
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+  
+  if (!res.ok) {
+    console.error(`HTTP ${res.status}: ${await res.text()}`);
+    return undefined;
+  }
+
+  try {
+    data = await res.json();
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+
+  const balance = BigInt(decodeClarityValue(data.balance).value);
+  const locked = BigInt(decodeClarityValue(data.locked).value);
+  const nonce = BigInt(data.nonce);
+  const unlock_height = BigInt(data.unlock_height);
+
+  const ret = {
+    balance: balance,
+    locked: locked,
+    unlock_height: unlock_height,
+    nonce: nonce
+  };
+  return ret;
+}
+
 // CLI subcommand for encoding clarity values
 function encodeCLI(argv) {
   const opts = getCLIOpts(argv, "", {});
@@ -1326,9 +1422,31 @@ async function contractGetInterfaceCLI(argv) {
   return res;
 }
 
+// CLI subcommand for getting an account balance
+async function getAccountCLI(argv) {
+  const opts = getCLIOpts(argv, "n:", {
+    "n": "node",
+  });
+  
+  let node = opts['n'];
+  if (node === null) {
+    node = DEFAULT_NODE;
+  }
+  const args = opts['_'];
+  if (args.length !== 1) {
+    usageAccountGet();
+  }
+
+  const address = args[0];
+  const account = await getAccount(node, address);
+  return account;
+}
+
 function printOrExit(res) {
   if (res !== undefined) {
-    console.log(JSON.stringify(res));
+    console.log(JSON.stringify(res, (key, value) =>
+      typeof value === 'bigint' ? value.toString() : value
+    ));
   }
   else {
     process.exit(1);
@@ -1368,6 +1486,10 @@ async function main() {
   }
   else if (subcommand === "get-api") {
     const res = await contractGetInterfaceCLI(argv.slice(2));
+    printOrExit(res);
+  }
+  else if (subcommand === "get-account") {
+    const res = await getAccountCLI(argv.slice(2));
     printOrExit(res);
   }
   else if (subcommand === "read-only-call") {

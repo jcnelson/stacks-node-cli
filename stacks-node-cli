@@ -105,15 +105,16 @@ function usageEncodeCLI() {
   console.error(
     `Usage: ${process.argv[1]} encode type value [type value ...]\n` +
     `Where \`type\` and \`value\` adhere to the following grammar:\n` +
+    `(note that '++' means 'concatenation')\n` +
     `\n` +
     `   Integer         = (any i128 value)\n` +
     `   UInteger        = (any u128 value)\n` +
     `   C32Address      = (any Crockford-32 checksum-encoded address)\n` +
-    `   HexString       = 0x, (any string that matches the regex /^[0-9a-f]$/\n` +
+    `   HexString       = "0x" ++ (any string that matches the regex /^[0-9a-f]$/)\n` +
     `   ClarityLiteral  = (any string that is a valid Clarity literal)\n` +
     `   ContractName    = (any string that is a valid Clarity contract name)\n` +
-    `   ASCIIString     = "" | ", (any string made of just ASCII characters), "\n` +
-    `   UTF8String      = "" | ", (any string made of just UTF-8 codepoints), "\n` +
+    `   ASCIIString     = " ++ (any string made of just ASCII characters) ++ "\n` +
+    `   UTF8String      = " ++ (any string made of UTF-8 codepoints) ++ "\n` +
     `\n` +
     `   AddressString   = C32Address | C32Address, ContractName\n` +
     `\n` +
@@ -1424,7 +1425,8 @@ async function contractGetInterfaceCLI(argv) {
 
 // CLI subcommand for getting an account balance
 async function getAccountCLI(argv) {
-  const opts = getCLIOpts(argv, "n:", {
+  const opts = getCLIOpts(argv, "n:b:", {
+    "b": "at-block",
     "n": "node",
   });
   
@@ -1432,13 +1434,14 @@ async function getAccountCLI(argv) {
   if (node === null) {
     node = DEFAULT_NODE;
   }
+  const tip = opts['b'];
   const args = opts['_'];
   if (args.length !== 1) {
     usageAccountGet();
   }
 
   const address = args[0];
-  const account = await getAccount(node, address);
+  const account = await getAccount(node, address, tip);
   return account;
 }
 
